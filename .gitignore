@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+venv/
+.env
+attendance.csv
+models/
