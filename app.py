@@ -1,71 +1,69 @@
-from flask import Flask, render_template, Response
+import streamlit as st
 import cv2
 import numpy as np
 import os
 import pandas as pd
 from datetime import datetime
+import time
 
-app = Flask(__name__)
-
+# ================= SETTINGS =================
 IMAGE_DIR = "images"
 ATTENDANCE_FILE = "attendance.csv"
-SIMILARITY_THRESHOLD = 0.55
-CAMERA_INDEX = 0   # try 0 first, if external cam then 1
+CAMERA_INDEX = 0
 
-detector = cv2.FaceDetectorYN.create(
-    "models/face_detection_yunet_2023mar.onnx", "", (320, 320)
-)
-recognizer = cv2.FaceRecognizerSF.create(
-    "models/face_recognition_sface_2021dec.onnx", ""
-)
+# ================= LOAD MODELS =================
+@st.cache_resource
+def load_models():
+    detector = cv2.FaceDetectorYN.create(
+        "models/face_detection_yunet_2023mar.onnx", "", (320, 320)
+    )
+    recognizer = cv2.FaceRecognizerSF.create(
+        "models/face_recognition_sface_2021dec.onnx", ""
+    )
+    return detector, recognizer
 
-known_names = []
-known_rolls = []
-known_embeddings = []
+detector, recognizer = load_models()
 
-# ================= LOAD KNOWN FACES =================
-for folder in os.listdir(IMAGE_DIR):
-    path = os.path.join(IMAGE_DIR, folder)
-    if not os.path.isdir(path):
-        continue
+# ================= LOAD FACES =================
+@st.cache_resource
+def load_faces():
+    data = {}
 
-    try:
+    for folder in os.listdir(IMAGE_DIR):
+        path = os.path.join(IMAGE_DIR, folder)
+        if not os.path.isdir(path):
+            continue
+
         roll, name = folder.split("_", 1)
-        roll = int(roll)
-    except:
-        continue
+        embeddings = []
 
-    person_embs = []
+        for img_name in os.listdir(path):
+            img = cv2.imread(os.path.join(path, img_name))
+            if img is None:
+                continue
 
-    for img_name in os.listdir(path):
-        img = cv2.imread(os.path.join(path, img_name))
-        if img is None:
-            continue
+            h, w = img.shape[:2]
+            detector.setInputSize((w, h))
+            _, faces = detector.detect(img)
 
-        h, w = img.shape[:2]
-        detector.setInputSize((w, h))
-        _, faces = detector.detect(img)
-        if faces is None:
-            continue
+            if faces is None:
+                continue
 
-        aligned = recognizer.alignCrop(img, faces[0])
-        emb = recognizer.feature(aligned).flatten()
-        emb = emb / np.linalg.norm(emb)
-        person_embs.append(emb)
+            aligned = recognizer.alignCrop(img, faces[0])
+            emb = recognizer.feature(aligned).flatten()
+            emb = emb / np.linalg.norm(emb)
+            embeddings.append(emb)
 
-    if person_embs:
-        avg_emb = np.mean(person_embs, axis=0)
-        avg_emb = avg_emb / np.linalg.norm(avg_emb)
-        known_embeddings.append(avg_emb)
-        known_names.append(name)
-        known_rolls.append(roll)
+        if embeddings:
+            avg = np.mean(embeddings, axis=0)
+            avg = avg / np.linalg.norm(avg)
+            data[int(roll)] = {"name": name, "embedding": avg}
 
-if not known_embeddings:
-    print("No valid faces loaded")
-    exit()
+    return data
 
-marked_today = set()
+known_data = load_faces()
 
+# ================= ATTENDANCE =================
 def mark_attendance(roll, name):
     today = datetime.now().strftime("%Y-%m-%d")
     time_now = datetime.now().strftime("%H:%M:%S")
@@ -76,71 +74,103 @@ def mark_attendance(roll, name):
         df = pd.DataFrame(columns=["Roll No", "Name", "Date", "Time"])
 
     if not ((df["Roll No"] == roll) & (df["Date"] == today)).any():
-        df.loc[len(df)] = [roll, name, today, time_now]
-        df = df.sort_values("Roll No")
+        new_row = pd.DataFrame([[roll, name, today, time_now]],
+                               columns=["Roll No", "Name", "Date", "Time"])
+        df = pd.concat([df, new_row], ignore_index=True)
         df.to_csv(ATTENDANCE_FILE, index=False)
-        print(f"Attendance marked: {name}")
+        return True
+    return False
 
-# ================= CAMERA =================
-cap = cv2.VideoCapture(1, cv2.CAP_MSMF)  # Use your external camera
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+# ================= STREAMLIT UI =================
+st.title("Face Attendance System")
 
-def gen_frames():
-    global cap
-    while True:
-        success, frame = cap.read()
-        if not success:
-            break
+threshold = st.slider("Accuracy Threshold", 0.3, 0.7, 0.45)
 
-        h, w = frame.shape[:2]
-        detector.setInputSize((w, h))
-        _, faces = detector.detect(frame)
+col1, col2 = st.columns(2)
+if col1.button("Start Camera"):
+    st.session_state.run = True
 
-        if faces is not None:
-            for face in faces:
-                x, y, fw, fh = map(int, face[:4])
+if col2.button("Stop Camera"):
+    st.session_state.run = False
 
-                aligned = recognizer.alignCrop(frame, face)
-                emb = recognizer.feature(aligned).flatten()
-                emb = emb / np.linalg.norm(emb)
+if "run" not in st.session_state:
+    st.session_state.run = False
 
-                sims = [np.dot(emb, ref) for ref in known_embeddings]
-                idx = int(np.argmax(sims))
-                score = sims[idx]
+if "cap" not in st.session_state:
+    st.session_state.cap = cv2.VideoCapture(CAMERA_INDEX)
 
-                if score > SIMILARITY_THRESHOLD:
-                    name = known_names[idx]
-                    roll = known_rolls[idx]
+if "marked" not in st.session_state:
+    st.session_state.marked = set()
 
-                    if roll not in marked_today:
-                        marked_today.add(roll)
-                        mark_attendance(roll, name)
+FRAME = st.empty()
+status = st.empty()
 
-                    label = f"{roll} - {name}"
-                    color = (0, 255, 0)
-                else:
-                    label = "UNKNOWN"
-                    color = (0, 0, 255)
+# ================= FRAME PROCESS =================
+def process_frame(frame):
+    h, w = frame.shape[:2]
+    detector.setInputSize((w, h))
+    _, faces = detector.detect(frame)
 
-                cv2.rectangle(frame, (x, y), (x+fw, y+fh), color, 2)
-                cv2.putText(frame, label, (x, y-10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+    if faces is not None:
+        for face in faces:
+            x, y, fw, fh = map(int, face[:4])
 
-        ret, buffer = cv2.imencode('.jpg', frame)
-        frame = buffer.tobytes()
+            aligned = recognizer.alignCrop(frame, face)
+            emb = recognizer.feature(aligned).flatten()
+            emb = emb / np.linalg.norm(emb)
 
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+            best_score = -1
+            best_roll = None
 
-@app.route('/')
-def index():
-    return render_template('index.html')
+            for roll, info in known_data.items():
+                sim = np.dot(emb, info["embedding"])
+                if sim > best_score:
+                    best_score = sim
+                    best_roll = roll
 
-@app.route('/video_feed')
-def video_feed():
-    return Response(gen_frames(),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
+            if best_score > threshold:
+                name = known_data[best_roll]["name"]
 
-if __name__ == "__main__":
-    app.run(debug=True, use_reloader=False, threaded=False)
+                if best_roll not in st.session_state.marked:
+                    if mark_attendance(best_roll, name):
+                        status.success(f"Marked: {name}")
+                    st.session_state.marked.add(best_roll)
+
+                label = f"{best_roll}-{name}"
+                color = (0, 255, 0)
+            else:
+                label = "UNKNOWN"
+                color = (0, 0, 255)
+
+            cv2.rectangle(frame, (x, y), (x+fw, y+fh), color, 2)
+            cv2.putText(frame, label, (x, y-10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+
+    return frame
+
+# ================= MAIN LOOP (FIXED) =================
+if st.session_state.run:
+    cap = st.session_state.cap
+
+    ret, frame = cap.read()
+    if ret:
+        frame = process_frame(frame)
+        FRAME.image(frame, channels="BGR")
+    else:
+        st.error("Camera not working")
+
+    time.sleep(0.03)
+    st.rerun()
+
+# ================= TABLE =================
+st.subheader("Attendance")
+
+if os.path.exists(ATTENDANCE_FILE):
+    df = pd.read_csv(ATTENDANCE_FILE)
+    st.dataframe(df)
+
+    st.download_button(
+        "Download CSV",
+        df.to_csv(index=False),
+        file_name="attendance.csv"
+    )
